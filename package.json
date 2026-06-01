@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "claude": "^0.1.2",
+    "code": "^5.2.4"
+  }
+}
