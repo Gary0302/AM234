@@ -1,0 +1,9 @@
+node_modules/
+*.pyc
+__pycache__/
+*.pt
+*.npy
+*.mat
+*.gz
+data/
+runs/
