@@ -1,7 +1,7 @@
 # Data & Checkpoints
 
-All data and model weights live on the H400 GPU server.  
-Contact Gary Yang (yanggary2388@gmail.com) for server access.
+Model weights live on the H400 GPU server.  
+All fine-mapping data (GWAS, ISM scores, LD matrices) is bundled in this repo under `data/`.
 
 ---
 
@@ -22,7 +22,7 @@ Use `CausalConvDual` for ISM scoring — it gives the strongest functional signa
 
 ## Reference Genome (hg19)
 
-Available chromosomes (covers all 5 GWAS loci used in this study):
+Available chromosomes on the H400 server (covers all 5 GWAS loci):
 
 ```
 /home/gary/snowball/experiments/exp82_genomics_ordersnn/data/hg19/
@@ -31,32 +31,91 @@ Available chromosomes (covers all 5 GWAS loci used in this study):
   chr19.fa   chr19.fa.fai
 ```
 
-If your SNPs are on other chromosomes, download the missing ones:
+If your SNPs are on other chromosomes:
 ```bash
-# Example for chr22
 wget -P data/hg19 \
   https://hgdownload.soe.ucsc.edu/goldenPath/hg19/chromosomes/chr22.fa.gz
-gunzip data/hg19/chr22.fa.gz
-samtools faidx data/hg19/chr22.fa
+gunzip data/hg19/chr22.fa.gz && samtools faidx data/hg19/chr22.fa
 ```
 
 ---
 
-## GWAS Summary Statistics
+## Fine-Mapping Data (in this repo)
 
-GLGC 2013 LDL-C (Willer et al.), pre-extracted for 5 lipid loci (±300 kb):
+Everything needed to run `scripts/susie_ism_pipeline.py` is in `data/`:
 
 ```
-/home/gary/snowball/experiments/exp82_genomics_ordersnn/data/gwas/loci/
-  SORT1_LDL.tsv    PCSK9_LDL.tsv    HMGCR_LDL.tsv
-  LDLR_LDL.tsv     APOE_LDL.tsv
+data/
+  gwas/
+    SORT1_LDL.tsv     PCSK9_LDL.tsv     HMGCR_LDL.tsv
+    LDLR_LDL.tsv      APOE_LDL.tsv
+  ism/
+    ism_scores.tsv    (4033 SNPs × 5 loci, CausalConvDual / v7 model)
+  ld/
+    SORT1_snps.tsv    SORT1_ld.npy    (1590 SNPs)
+    PCSK9_snps.tsv    PCSK9_ld.npy    (2233 SNPs)
+    HMGCR_snps.tsv    HMGCR_ld.npy    (1409 SNPs)
+    LDLR_snps.tsv     LDLR_ld.npy     (1694 SNPs)
+    APOE_snps.tsv     APOE_ld.npy     (1970 SNPs)
 ```
 
+### GWAS files
+
+GLGC 2013 LDL-C (Willer et al.), ±300 kb windows around each locus.  
 Columns: `rsid  chr  pos  A1  A2  beta  se  z  N  pval`
 
+### ISM scores (`data/ism/ism_scores.tsv`)
+
+Columns: `chrom  pos  ref  alt  name  sum_abs_delta  max_abs_delta`
+
+The `name` field encodes locus membership: **`{rsid}_locus{i}_{j}`**
+- `i` = locus index: 0=SORT1, 1=PCSK9, 2=HMGCR, 3=LDLR, 4=APOE
+- `j` = SNP index within that locus (matches row order in the GWAS TSV)
+
+Use this to map ISM scores back to the correct SNP in the LD panel:
+
+```python
+import numpy as np, pandas as pd
+
+ism   = pd.read_csv("data/ism/ism_scores.tsv", sep="\t")
+snps  = pd.read_csv("data/ld/SORT1_snps.tsv",  sep="\t")   # 1000G panel
+LD    = np.load("data/ld/SORT1_ld.npy")                    # shape [p, p]
+
+# Build pi prior: uniform baseline boosted by ISM score
+p  = len(snps)
+pi = np.ones(p) / p
+ism_by_rsid = {r["name"].split("_")[0].lower(): float(r["sum_abs_delta"])
+               for _, r in ism.iterrows()
+               if r["sum_abs_delta"] not in ("NA", "")}
+
+for i, row in snps.iterrows():
+    score = ism_by_rsid.get(row["rsid"].lower())
+    if score is not None:
+        pi[i] += 10 * score
+pi /= pi.sum()
+```
+
+### LD matrices (`data/ld/`)
+
+Pre-computed from 1000 Genomes Phase 3 (EUR superpopulation, n=503).  
+`{LOCUS}_snps.tsv` — SNP panel: `rsid  pos  ref  alt`  
+`{LOCUS}_ld.npy`   — Pearson correlation matrix, float32, shape `[p, p]`
+
 ---
 
-## Running ISM on Your SNP List
+## Running the Pipeline
+
+```bash
+cd /path/to/AM234
+python3 scripts/susie_ism_pipeline.py
+```
+
+No internet access or server access required — all data is in `data/`.  
+Results are written to `data/susie_results.tsv`.
+
+---
+
+## Running ISM on Your Own SNP List
 
 ### 1. Prepare your SNP file (TSV, no header)
 
@@ -68,58 +127,25 @@ chr19    45411941   T   C   rs429358
 
 Columns: `chrom  pos(1-based)  ref_allele  alt_allele  [optional_name]`
 
-### 2. Run scoring
+### 2. Run scoring (on H400 server)
 
 ```bash
 cd /home/gary/snowball/experiments/exp82_genomics_ordersnn
 
-MODEL=CausalConvDual \
+MODEL=v7 \
 CKPT=runs/spike_attn_v7/best.pt \
 SNP_FILE=/path/to/your_snps.tsv \
-OUT_DIR=/path/to/output \
+HG19_DIR=data/hg19 \
+OUT_DIR=/tmp/ism_output \
 DEVICE=cuda:0 \
 python3 scripts/ism_ablation.py
 ```
-
-To compare across all 4 models, change `MODEL` and `CKPT` to each checkpoint in turn.
 
 ### 3. Output files
 
 | File | Shape | Description |
 |------|-------|-------------|
-| `ref_matrix.npy` | `[n_SNPs, 919]` | Predicted probabilities for reference allele |
-| `alt_matrix.npy` | `[n_SNPs, 919]` | Predicted probabilities for alternative allele |
-| `delta_matrix.npy` | `[n_SNPs, 919]` | `alt − ref` (signed per-track effect) |
+| `ref_matrix.npy` | `[n_SNPs, 919]` | Reference allele predicted probabilities |
+| `alt_matrix.npy` | `[n_SNPs, 919]` | Alternative allele predicted probabilities |
+| `delta_matrix.npy` | `[n_SNPs, 919]` | `alt − ref` signed per-track effect |
 | `ism_scores.tsv` | `n_SNPs rows` | `sum_abs_delta`, `max_abs_delta` per SNP |
-
-### 4. Using ISM scores as SuSiE priors
-
-`sum_abs_delta` (or `max_abs_delta`) from `ism_scores.tsv` can be used directly as the functional prior `pi` in SuSiE:
-
-```python
-import numpy as np, pandas as pd
-
-scores = pd.read_csv("ism_scores.tsv", sep="\t")
-# Build pi vector: uniform baseline, boosted at scored positions
-pi = np.ones(n_snps_in_locus) / n_snps_in_locus
-for snp_idx, score in zip(scores["locus_index"], scores["sum_abs_delta"]):
-    pi[snp_idx] += 10 * score
-pi /= pi.sum()
-
-# Pass pi to SuSiE as the prior inclusion probability
-```
-
-A full worked example covering the 5 GLGC loci (1000G LD + SuSiE-RSS) is in `scripts/susie_ism_pipeline.py`.
-
----
-
-## Pre-computed ISM Scores
-
-ISM scores for 7 known causal lipid variants, all 4 models (stored on H400):
-
-```
-/tmp/ism_v6_b/ism_scores.tsv     SmallWindow
-/tmp/ism_v6/ism_scores.tsv       CausalConvSingle
-/tmp/ism_v6_b2/ism_scores.tsv    SmallWindowDual
-/tmp/ism_v7/ism_scores.tsv       CausalConvDual
-```
